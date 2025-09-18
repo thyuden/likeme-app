@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Excel 파일 업로드 (Python)</title>
+<script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+<style>
+body { font-family: sans-serif; margin: 2em; }
+table { border-collapse: collapse; margin-top: 1em; width: 100%; table-layout: auto; }
+th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; font-size: 11px; word-break: break-word; white-space: normal; }
+th { background-color: #f2f2f2; }
+#result-container { margin-top: 20px; }
+.tab-nav {
+    border-bottom: 1px solid #ccc;
+    margin-bottom: 0;
+    position: sticky;
+    top: 0;
+    background-color: white;
+    z-index: 100;
+}
+.tab-link { background-color: #f1f1f1; border: 1px solid transparent; border-bottom: none; cursor: pointer; padding: 10px 15px; font-size: 14px; }
+.tab-link.active { background-color: #fff; border-color: #ccc; border-bottom: 1px solid #fff; margin-bottom: -1px; }
+.tab-pane { display: none; padding: 15px; border: 1px solid #ccc; border-top: none; }
+.tab-pane.active { display: block; }
+/* .invoice-table { table-layout: fixed; } -> auto 레이아웃으로 변경하여 내용에 따라 너비 조절 */
+
+/* 송장출력 테이블 열 너비 조정 */
+.invoice-table th.col-prod { width: 25%; } /* 상품명 */
+.invoice-table th.col-addr { width: 27%; } /* 수취인 주소 */
+.invoice-table th.col-phone,
+.invoice-table th.col-mobile { width: 7%; } /* 전화번호, 이동통신 */
+.invoice-table th.col-remark { width: 1%; } /* 비고 */
+.invoice-table th.col-empty { width: 1%; } /* 내용 없는 열 */
+
+/* td에도 동일한 클래스를 적용하여 줄바꿈 등 일관성 유지 */
+.invoice-table td { word-break: break-all; }
+
+/* '배송메세지' 열 스타일: 줄바꿈 방지 및 내용 자르기 */
+.invoice-table .col-clip {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis; /* 잘린 텍스트 뒤에 ... 표시 */
+}
+
+/* 테이블 행 하이라이트 */
+tbody tr:hover {
+    background-color: #f0f8ff; /* 마우스를 올렸을 때 배경색 변경 (aliceblue) */
+}
+
+/* 가운데 정렬 스타일 */
+.col-center {
+    text-align: center;
+}
+
+/* 재고 부족 하이라이트 */
+.inventory-shortage {
+    background-color: #ffdddd !important; /* 연한 빨강, 다른 hover 효과보다 우선 적용 */
+    font-weight: bold;
+}
+
+.error-message { color: red; }
+
+/* 제품취합/장부입력 테이블 스타일 */
+.summary-table {
+    width: auto; /* 내용에 맞게 너비 자동 조절 */
+}
+
+/* 재고 입력 탭 스타일 */
+#inventory-grid-container {
+    height: 400px;
+    overflow: auto;
+    border: 1px solid #ccc;
+}
+.editable-grid {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+}
+.editable-grid th, .editable-grid td {
+    border: 1px solid #ddd;
+    padding: 5px;
+    font-size: 12px;
+}
+.editable-grid th {
+    background-color: #f2f2f2;
+    position: sticky;
+    top: 0;
+}
+#inventory-status {
+    margin-top: 10px;
+    font-weight: bold;
+}
+
+/* 복사 가능한 헤더 스타일 */
+.copyable-header {
+    cursor: pointer;
+}
+</style>
+</head>
+<body>
+
+<h1>Excel 파일 업로드 및 송장출력</h1>
+
+<form id="upload-form">
+<input type="file" id="file-input" name="file" accept=".xls, .xlsx">
+<button type="submit">업로드</button>
+</form>
+
+<div id="result-container" style="display: none;">
+<div class="tab-nav">
+<button class="tab-link active" data-tab="full-data-tab">전체 데이터</button>
+<button class="tab-link" data-tab="extracted-data-tab">정리</button>
+<button class="tab-link" data-tab="invoice-data-tab">송장출력</button>
+<button class="tab-link" data-tab="summary-tab">제품취합/장부입력</button>
+<button class="tab-link" data-tab="inventory-input-tab">재고</button>
+<button class="tab-link" data-tab="mapping-admin-tab">상품명 변경</button>
+</div>
+<div id="tab-content">
+<div id="full-data-tab" class="tab-pane active"></div>
+<div id="extracted-data-tab" class="tab-pane"></div>
+<div id="invoice-data-tab" class="tab-pane"></div>
+<div id="summary-tab" class="tab-pane"></div>
+<div id="inventory-input-tab" class="tab-pane"></div>
+<div id="mapping-admin-tab" class="tab-pane"></div>
+</div>
+<div id="error-message-container" style="color: red; margin-top: 15px;"></div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    // --- 전역 변수 및 공용 함수 ---
+    const escapeHtml = (str) => {
+        if (!str) return '';
+        return String(str).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", "&#39;");
+    };
+
+    // --- 탭 기능 초기화 ---
+    const initializeTabs = () => {
+        document.querySelectorAll('.tab-link').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.tab-link').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+                btn.classList.add('active');
+                document.getElementById(btn.dataset.tab).classList.add('active');
+            });
+        });
+    };
+
+    // --- 관리 탭(재고, 상품명변경) 초기화 ---
+    const initializeAdminTabs = () => {
+        // 재고 탭 UI 구성 및 이벤트 핸들러
+        const inventoryTab = document.getElementById('inventory-input-tab');
+        const inventoryHeaders = ['상품코드', '제품위치', '-', '상품명', '-', '-', '본사창고', '불량창고', '업체창고', 'A/S창고', '-', '-', '-', '-', '-', '-', '-', '-', '재고수량', '단가', '-', '본사창고', '불량창고', '스마트 인천이동', '업체창고', '인천창고', '입고대기창고', 'A/S창고'];
+        const createInventoryRows = (count) => { const tbody = inventoryTab.querySelector('tbody'); if (!tbody) return; const newRowHtml = '<tr>' + '<td contenteditable="true"></td>'.repeat(inventoryHeaders.length) + '</tr>'; for (let i = 0; i < count; i++) { tbody.insertAdjacentHTML('beforeend', newRowHtml); } };
+        inventoryTab.innerHTML = `<h2>재고 데이터 입력</h2><p>ERP 등에서 재고 데이터를 복사하여 아래 표에 붙여넣거나 직접 입력하세요.</p><div id="inventory-grid-container"><table id="inventory-grid" class="editable-grid"><thead><tr>${inventoryHeaders.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody></tbody></table></div><button id="add-inventory-row-btn" style="margin-top:10px;">행 추가</button><button id="save-and-apply-inventory-btn" style="margin-top:10px; background-color: #d4edda; font-weight: bold;">재고 저장 및 적용</button><button id="reset-inventory-btn" style="margin-top:10px;">재고 다시 넣기</button><div id="inventory-status"></div>`;
+        
+        fetch('/inventory').then(res => res.json()).then(data => {
+            const tbody = inventoryTab.querySelector('tbody');
+            if (data && data.length > 0) {
+                data.forEach(item => {
+                    const row = document.createElement('tr');
+                    row.innerHTML = inventoryHeaders.map(header => `<td contenteditable="true">${escapeHtml(item[header] || '')}</td>`).join('');
+                    tbody.appendChild(row);
+                });
+            }
+            createInventoryRows(50);
+        }).catch(() => createInventoryRows(200));
+
+        inventoryTab.addEventListener('click', async (e) => {
+            if (e.target.id === 'add-inventory-row-btn') createInventoryRows(20);
+            if (e.target.id === 'reset-inventory-btn') {
+                inventoryTab.querySelector('tbody').innerHTML = '';
+                createInventoryRows(200);
+                inventoryTab.querySelector('#inventory-status').textContent = '재고 입력란이 초기화되었습니다.';
+            }
+            if (e.target.id === 'save-and-apply-inventory-btn') {
+                const statusEl = inventoryTab.querySelector('#inventory-status');
+                const rows = inventoryTab.querySelectorAll('tbody tr');
+                const inventoryMap = new Map();
+                const inventoryDataToSave = [];
+                rows.forEach(row => {
+                    const cells = row.querySelectorAll('td');
+                    if (cells.length < 26) return;
+                    const itemCode = cells[0]?.textContent.trim();
+                    if (itemCode) {
+                        const stockData = { '상품코드': itemCode, '본사창고': cells[21]?.textContent.trim() || '', '업체창고': cells[24]?.textContent.trim() || '', '스마트 인천창고': cells[23]?.textContent.trim() || '', '인천창고': cells[25]?.textContent.trim() || '' };
+                        inventoryMap.set(itemCode, stockData);
+                        const rowData = {};
+                        inventoryHeaders.forEach((header, index) => { rowData[header] = cells[index]?.textContent.trim() || ''; });
+                        inventoryDataToSave.push(rowData);
+                    }
+                });
+                if (inventoryMap.size === 0) { statusEl.textContent = '저장할 데이터가 없습니다.'; statusEl.style.color = 'red'; return; }
+                statusEl.textContent = '저장 중...'; statusEl.style.color = 'blue';
+                try {
+                    const response = await fetch('/inventory', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(inventoryDataToSave) });
+                    const result = await response.json();
+                    if (!response.ok) throw new Error(result.error || '알 수 없는 오류');
+                    statusEl.textContent = `✅ ${result.message} '정리' 탭에 적용합니다.`; statusEl.style.color = 'green';
+                    const extractedTable = document.querySelector('#extracted-data-tab table');
+                    if (!extractedTable) return;
+                    const tableHeader = Array.from(extractedTable.querySelectorAll('thead th')).map(th => th.textContent);
+                    const tableCodeIndex = tableHeader.indexOf('품목코드');
+                    if (tableCodeIndex === -1) return;
+                    const bonsaIndex = tableHeader.indexOf('본사창고');
+                    const upcheIndex = tableHeader.indexOf('업체창고');
+                    const smartIndex = tableHeader.indexOf('스마트 인천창고');
+                    const incheonIndex = tableHeader.indexOf('인천창고');
+                    extractedTable.querySelectorAll('tbody tr').forEach(row => {
+                        const itemCode = row.cells[tableCodeIndex].textContent.trim();
+                        const stockData = inventoryMap.get(itemCode);
+                        if (stockData) {
+                            if (bonsaIndex !== -1) row.cells[bonsaIndex].textContent = stockData['본사창고'];
+                            if (upcheIndex !== -1) row.cells[upcheIndex].textContent = stockData['업체창고'];
+                            if (smartIndex !== -1) row.cells[smartIndex].textContent = stockData['스마트 인천창고'];
+                            if (incheonIndex !== -1) row.cells[incheonIndex].textContent = stockData['인천창고'];
+                        }
+                    });
+                    if (window.highlightInventoryShortage) window.highlightInventoryShortage();
+                } catch (error) { statusEl.textContent = `❌ 저장 실패: ${error.message}`; statusEl.style.color = 'red'; }
+            }
+        });
+        inventoryTab.addEventListener('paste', (e) => { e.preventDefault(); const pasteData = (e.clipboardData || window.clipboardData).getData('text'); const startCell = e.target.closest('td'); if (!startCell) return; const lines = pasteData.trim().split('\n'); const allTableRows = Array.from(inventoryTab.querySelectorAll('tbody tr')); const startRowIndex = allTableRows.indexOf(startCell.parentElement); const startColIndex = Array.from(startCell.parentElement.children).indexOf(startCell); lines.forEach((line, lineIndex) => { const currentRowIndex = startRowIndex + lineIndex; const cells = line.split('\t'); let currentRows = inventoryTab.querySelectorAll('tbody tr'); while (currentRowIndex >= currentRows.length) { createInventoryRows(1); currentRows = inventoryTab.querySelectorAll('tbody tr'); } const currentRow = currentRows[currentRowIndex]; cells.forEach((cellValue, cellIndex) => { const currentColIndex = startColIndex + cellIndex; if (currentRow && currentRow.cells[currentColIndex]) { currentRow.cells[currentColIndex].textContent = cellValue.trim(); } }); }); });
+
+        // 상품명 변경 탭 UI 구성 및 이벤트 핸들러
+        const mappingTab = document.getElementById('mapping-admin-tab');
+        const mappingHeaders = ['라익미 파일 상품명', '상품코드', 'ER 상품명', '단가', '상품명 조절'];
+        const createMappingRows = (count) => { const tbody = mappingTab.querySelector('tbody'); if (!tbody) return; const newRowHtml = '<tr>' + '<td contenteditable="true"></td>'.repeat(mappingHeaders.length) + '</tr>'; for (let i = 0; i < count; i++) { tbody.insertAdjacentHTML('beforeend', newRowHtml); } };
+        mappingTab.innerHTML = `<h2>상품명 변경 규칙 관리</h2><p>이곳에서 상품명 변경 규칙을 관리할 수 있습니다. 입력된 내용은 서버에 저장되어 파일 업로드 시 자동으로 적용됩니다.</p><div id="mapping-grid-container" style="height: 400px; overflow: auto; border: 1px solid #ccc;"><table id="mapping-grid" class="editable-grid"><thead><tr>${mappingHeaders.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody></tbody></table></div><button id="add-mapping-row-btn" style="margin-top:10px;">행 추가</button><button id="reset-mapping-btn" style="margin-top:10px;">입력 초기화</button><button id="save-mapping-btn" style="margin-top:10px; background-color: #d4edda; font-weight: bold;">규칙 저장</button><div id="mapping-status" style="margin-top: 10px; font-weight: bold;"></div>`;
+
+        fetch('/mapping').then(res => res.json()).then(data => {
+            const tbody = mappingTab.querySelector('tbody');
+            if (data && data.length > 0) {
+                data.forEach(item => {
+                    const row = document.createElement('tr');
+                    row.innerHTML = mappingHeaders.map(header => `<td contenteditable="true">${escapeHtml(item[header] || '')}</td>`).join('');
+                    tbody.appendChild(row);
+                });
+            }
+            createMappingRows(50);
+        }).catch(() => createMappingRows(200));
+
+        mappingTab.addEventListener('click', async (e) => {
+            if (e.target.id === 'add-mapping-row-btn') createMappingRows(20);
+            if (e.target.id === 'reset-mapping-btn') {
+                mappingTab.querySelector('tbody').innerHTML = '';
+                createMappingRows(200);
+                mappingTab.querySelector('#mapping-status').textContent = '입력란이 초기화되었습니다.';
+            }
+            if (e.target.id === 'save-mapping-btn') {
+                const statusEl = mappingTab.querySelector('#mapping-status');
+                const rows = mappingTab.querySelectorAll('tbody tr');
+                const mappingData = [];
+                rows.forEach(row => {
+                    const cells = row.querySelectorAll('td');
+                    const firstCell = cells[0]?.textContent.trim();
+                    if (firstCell) {
+                        const rowData = {};
+                        mappingHeaders.forEach((header, index) => { rowData[header] = cells[index]?.textContent.trim() || ''; });
+                        mappingData.push(rowData);
+                    }
+                });
+                statusEl.textContent = '저장 중...'; statusEl.style.color = 'blue';
+                try {
+                    const response = await fetch('/mapping', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(mappingData) });
+                    const result = await response.json();
+                    if (!response.ok) throw new Error(result.error || '알 수 없는 오류');
+                    statusEl.textContent = `✅ ${result.message}`; statusEl.style.color = 'green';
+                } catch (error) { statusEl.textContent = `❌ 저장 실패: ${error.message}`; statusEl.style.color = 'red'; }
+            }
+        });
+        mappingTab.addEventListener('paste', (e) => { e.preventDefault(); const pasteData = (e.clipboardData || window.clipboardData).getData('text'); const startCell = e.target.closest('td'); if (!startCell) return; const lines = pasteData.trim().split('\n'); const allTableRows = Array.from(mappingTab.querySelectorAll('tbody tr')); const startRowIndex = allTableRows.indexOf(startCell.parentElement); const startColIndex = Array.from(startCell.parentElement.children).indexOf(startCell); lines.forEach((line, lineIndex) => { const currentRowIndex = startRowIndex + lineIndex; const cells = line.split('\t'); let currentRows = mappingTab.querySelectorAll('tbody tr'); while (currentRowIndex >= currentRows.length) { createMappingRows(1); currentRows = mappingTab.querySelectorAll('tbody tr'); } const currentRow = currentRows[currentRowIndex]; cells.forEach((cellValue, cellIndex) => { const currentColIndex = startColIndex + cellIndex; if (currentRow && currentRow.cells[currentColIndex]) { currentRow.cells[currentColIndex].textContent = cellValue.trim(); } }); }); });
+    };
+
+    // --- 결과 탭 렌더링 ---
+    const renderResultTabs = (data) => {
+        const resultContainer = document.getElementById('result-container');
+        const fullDataTab = document.getElementById('full-data-tab');
+        const extractedDataTab = document.getElementById('extracted-data-tab');
+        const invoiceDataTab = document.getElementById('invoice-data-tab');
+        const summaryTab = document.getElementById('summary-tab');
+        const errorContainer = document.getElementById('error-message-container');
+
+        const downloadExcelBlob = (workbook, fileName) => {
+            const wbout = XLSX.write(workbook, { bookType: 'biff8', type: 'array' });
+            const blob = new Blob([wbout], { type: "application/octet-stream" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => {
+                document.body.removeChild(a);
+                window.URL.revokeObjectURL(url);
+            }, 100);
+        };
+
+        const ADDR_CANDIDATES = ['수취인 주소','수취인주소','받는사람 주소','받는사람주소','받는사람'];
+        const PROD_CANDIDATES = ['상품명(제품)','상품명','제품','제품명','품목'];
+        const QTY_CANDIDATES = ['수량','수량(개)','수량(수량)','수량(수)','수량(개수)'];
+        const ITEM_CODE_CANDIDATES = ['품목코드'];
+
+        const createTable = (dataArray, title, tableClass = '') => {
+            if (!dataArray || dataArray.length === 0) return '';
+            const classAttr = tableClass ? ` class="${tableClass}"` : '';
+            let tableHtml = `<h2>${title}</h2><table${classAttr}><thead><tr>`;
+            dataArray[0].forEach(headerText => {
+                headerText = headerText || '';
+                let thClasses = [];
+                if (headerText === '품목코드') thClasses.push('copyable-header');
+                if (QTY_CANDIDATES.includes(headerText)) thClasses.push('col-center');
+                tableHtml += `<th class="${thClasses.join(' ')}">${headerText}</th>`;
+            });
+            tableHtml += '</tr></thead><tbody>';
+            dataArray.slice(1).forEach(row => {
+                tableHtml += '<tr>';
+                for (let i = 0; i < dataArray[0].length; i++) {
+                    const cell = row[i];
+                    const headerText = dataArray[0][i] || '';
+                    let tdClasses = [];
+                    if (QTY_CANDIDATES.includes(headerText)) tdClasses.push('col-center');
+                    tableHtml += `<td class="${tdClasses.join(' ')}">${cell !== undefined && cell !== null ? escapeHtml(cell) : ''}</td>`;
+                }
+                tableHtml += '</tr>';
+            });
+            return tableHtml + '</tbody></table>';
+        };
+
+        const formatQty = (rawQty) => { if (!rawQty) return 1; const s = String(rawQty).trim(); if (!s) return 1; if (/^\d+$/.test(s)) return parseInt(s); const removedX = s.replace(/^x/i, ''); return parseInt(removedX) || 1; };
+        const formatItem = (prod, qty) => ({ prod: prod || '', qty: qty || 1 });
+        const combineSameProduct = (items) => { const map = {}; items.forEach(it => { if (!map[it.prod]) map[it.prod] = 0; map[it.prod] += it.qty; }); return Object.entries(map).map(([prod, qty]) => ({ prod, qty })); };
+        const sortItemsHangulThenEngAsc = (items) => items.sort((a, b) => a.prod.localeCompare(b.prod, 'ko'));
+        const generateInvoiceText = (items) => { if (!items || items.length === 0) return ''; if (items.length === 1) return items[0].qty === 1 ? `${items[0].prod} - 1 EA` : `(수량) ${items[0].prod} - ${items[0].qty} EA`; return items.map(it => it.qty === 1 ? `▶▶ ${it.prod} - 1 EA` : `▶▶(수량) ${it.prod} - ${it.qty} EA`).join('<br>'); };
+        const generateInvoiceTextForExcel = (items) => { if (!items || items.length === 0) return ''; if (items.length === 1) return items[0].qty === 1 ? `${items[0].prod} - 1 EA` : `(수량) ${items[0].prod} - ${items[0].qty} EA`; return items.map(it => it.qty === 1 ? `▶▶ ${it.prod} - 1 EA` : `▶▶(수량) ${it.prod} - ${it.qty} EA`).join('\r\n'); };
+
+        window.highlightInventoryShortage = () => {
+            const extractedTable = document.querySelector('#extracted-data-tab table');
+            if (!extractedTable) return;
+            const tableHeader = Array.from(extractedTable.querySelectorAll('thead th')).map(th => th.textContent);
+            const qtyHeader = tableHeader.find(h => QTY_CANDIDATES.includes(h));
+            if (!qtyHeader) return;
+            const qtyIndex = tableHeader.indexOf(qtyHeader);
+            const bonsaIndex = tableHeader.indexOf('본사창고');
+            if (qtyIndex === -1 || bonsaIndex === -1) return;
+            extractedTable.querySelectorAll('tbody tr').forEach(row => {
+                const qtyCell = row.cells[qtyIndex];
+                const bonsaCell = row.cells[bonsaIndex];
+                if (!qtyCell || !bonsaCell) return;
+                [qtyCell, bonsaCell].forEach(c => c.classList.remove('inventory-shortage'));
+                const qty = parseInt(qtyCell.textContent, 10);
+                const bonsaStock = parseInt(bonsaCell.textContent, 10);
+                if (!isNaN(qty) && !isNaN(bonsaStock) && qty > bonsaStock) {
+                    [qtyCell, bonsaCell].forEach(c => c.classList.add('inventory-shortage'));
+                }
+            });
+        };
+
+        resultContainer.style.display = 'block';
+        errorContainer.innerHTML = '';
+        fullDataTab.innerHTML = data.full_data ? createTable(data.full_data, "전체 데이터") : '<p>전체 데이터가 없습니다.</p>';
+        if (data.extracted_data) {
+            const extractedDataForDisplay = JSON.parse(JSON.stringify(data.extracted_data));
+            const qtyIndex = extractedDataForDisplay[0].findIndex(h => QTY_CANDIDATES.includes(h));
+            if (qtyIndex !== -1) {
+                for (let i = 1; i < extractedDataForDisplay.length; i++) {
+                    extractedDataForDisplay[i][qtyIndex] = formatQty(extractedDataForDisplay[i][qtyIndex]);
+                }
+            }
+            extractedDataTab.innerHTML = createTable(extractedDataForDisplay, "정리");
+        } else {
+            extractedDataTab.innerHTML = '<p>정리할 데이터가 없습니다.</p>';
+        }
+
+        let parcelCount = 0;
+        if (data.full_data && data.full_data.length > 0) {
+            const headers = data.full_data[0].map(h => h || '');
+            const addrIndex = headers.findIndex(h => ADDR_CANDIDATES.includes(h));
+            const prodIndex = headers.findIndex(h => PROD_CANDIDATES.includes(h));
+            const orderNoIndex = headers.findIndex(h => h === '주문번호');
+            if (addrIndex === -1 || prodIndex === -1) {
+                invoiceDataTab.innerHTML += '<p>※ 수취인 주소 또는 상품명 열이 없습니다.</p>';
+            } else {
+                const fullDataLookup = {};
+                if (data.full_data && data.full_data.length > 1) {
+                    const fullHeaders = data.full_data[0].map(h => h || '');
+                    const fullAddrIndex = fullHeaders.findIndex(h => ADDR_CANDIDATES.includes(h));
+                    if (fullAddrIndex !== -1) { data.full_data.slice(1).forEach(row => { const addr = row[fullAddrIndex]?.trim(); if (addr && !fullDataLookup[addr]) { fullDataLookup[addr] = row; } }); }
+                }
+                const addrToData = {};
+                if (data.extracted_data && data.extracted_data.length > 1) {
+                    const extHeaders = data.extracted_data[0].map(h => h || '');
+                    const extAddrIndex = extHeaders.findIndex(h => ADDR_CANDIDATES.includes(h));
+                    const extProdIndex = extHeaders.findIndex(h => PROD_CANDIDATES.includes(h));
+                    const extQtyIndex = extHeaders.findIndex(h => QTY_CANDIDATES.includes(h));
+                    const extOrderNoIndex = extHeaders.findIndex(h => h === '주문번호');
+                    data.extracted_data.slice(1).forEach(row => { const addr = row[extAddrIndex]?.trim(); if (!addr) return; const prod = row[extProdIndex]?.trim() || ''; const qty = formatQty(row[extQtyIndex]); const orderNo = (extOrderNoIndex !== -1) ? (row[extOrderNoIndex] || '').toString().trim() : ''; if (!addrToData[addr]) { addrToData[addr] = { items: [], orderNo: orderNo }; } addrToData[addr].items.push(formatItem(prod, qty)); });
+                }
+                const invoiceRowsData = Object.keys(addrToData).map(addr => { let items = combineSameProduct(addrToData[addr].items); items = sortItemsHangulThenEngAsc(items); const fullRow = fullDataLookup[addr] || []; return { addr: addr, items: items, orderNo: addrToData[addr].orderNo, fullRow: fullRow }; });
+                invoiceRowsData.sort((a, b) => { const firstProdA = a.items.length > 0 ? a.items[0].prod : ''; const firstProdB = b.items.length > 0 ? b.items[0].prod : ''; return firstProdA.localeCompare(firstProdB, 'ko'); });
+                parcelCount = invoiceRowsData.length;
+                const totalProductQty = invoiceRowsData.reduce((total, row) => total + row.items.reduce((subtotal, item) => subtotal + item.qty, 0), 0);
+                const titleHtml = `<h2>송장출력 <span style="font-size: 14px; font-weight: normal; margin-left: 20px;">(택배수량: ${parcelCount} / 상품수량: ${totalProductQty} EA)</span></h2>`;
+                const columnHasContent = new Array(headers.length).fill(false);
+                invoiceRowsData.forEach(rowData => { for (let i = 0; i < headers.length; i++) { if (columnHasContent[i]) continue; let cellContent = ''; if (i === addrIndex) cellContent = rowData.addr; else if (i === prodIndex) cellContent = generateInvoiceText(rowData.items); else if (i === orderNoIndex) cellContent = rowData.orderNo; else if (rowData.fullRow[i] !== undefined) cellContent = rowData.fullRow[i]; if (cellContent && String(cellContent).trim() !== '') columnHasContent[i] = true; } });
+                const getColumnClass = (headerText, columnIndex) => { if (ADDR_CANDIDATES.includes(headerText)) return 'col-addr'; if (PROD_CANDIDATES.includes(headerText)) return 'col-prod'; if (headerText === '수취인 전화번호') return 'col-phone'; if (headerText === '수취인 이동통신') return 'col-mobile'; if (headerText === '비고') return 'col-remark'; if (headerText === '배송메세지') return 'col-clip'; if (!columnHasContent[columnIndex]) return 'col-empty'; return ''; };
+                invoiceDataTab.innerHTML = `${titleHtml}<table class="invoice-table"><thead><tr>${headers.map((h, i) => `<th class="${getColumnClass(h, i)}">${escapeHtml(h)}</th>`).join('')}</tr></thead><tbody>${invoiceRowsData.map(rowData => `<tr>${headers.map((h, i) => { const className = getColumnClass(h, i); let cellHtml = ''; if (i === addrIndex) cellHtml = escapeHtml(rowData.addr); else if (i === prodIndex) cellHtml = generateInvoiceText(rowData.items); else if (i === orderNoIndex) cellHtml = escapeHtml(rowData.orderNo); else if (rowData.fullRow[i] !== undefined) cellHtml = escapeHtml(rowData.fullRow[i]); return `<td class="${className}">${cellHtml}</td>`; }).join('')}</tr>`).join('')}</tbody></table>`;
+                const invoiceTitle = invoiceDataTab.querySelector('h2');
+                if (invoiceTitle && !invoiceTitle.querySelector('button')) {
+                    invoiceTitle.insertAdjacentHTML('beforeend', ` <button id="download-invoice-btn" style="font-size: 12px; vertical-align: middle;">XLS 다운로드</button>`);
+                    document.getElementById('download-invoice-btn').addEventListener('click', () => { if (headers && invoiceRowsData) { const dataForExport = [headers]; invoiceRowsData.forEach(rowData => { const exportRow = []; for (let i = 0; i < headers.length; i++) { if (i === addrIndex) exportRow.push(rowData.addr); else if (i === prodIndex) exportRow.push(generateInvoiceTextForExcel(rowData.items)); else if (i === orderNoIndex) exportRow.push(rowData.orderNo); else if (rowData.fullRow[i] !== undefined) exportRow.push(rowData.fullRow[i]); else exportRow.push(''); } dataForExport.push(exportRow); }); const ws = XLSX.utils.aoa_to_sheet(dataForExport); const colWidths = headers.map((h, i) => { if (i === prodIndex) return { wch: 50 }; if (i === addrIndex) return { wch: 45 }; if (h === '주문번호' || h === '수취인명') return { wch: 20 }; return { wch: 12 }; }); ws['!cols'] = colWidths; Object.keys(ws).forEach(k => { if (k[0] === '!') return; if (!ws[k].s) ws[k].s = {}; if (!ws[k].s.alignment) ws[k].s.alignment = {}; ws[k].s.alignment.wrapText = true; ws[k].s.alignment.vertical = 'top'; }); ws['!rows'] = dataForExport.map(row => { let maxLines = 1; row.forEach(cell => { if (typeof cell === 'string') { const lines = (cell.match(/\r?\n/g) || []).length + 1; if (lines > maxLines) maxLines = lines; } }); return { hpt: maxLines * 18 }; }); const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "송장출력");
+                        const today = new Date();
+                        const dateString = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, '0')}${String(today.getDate()).padStart(2, '0')}`;
+                        const fileName = `라익미 송장_${dateString}.xls`;
+                        downloadExcelBlob(wb, fileName);
+                    } });
+                }
+            }
+        } else {
+            invoiceDataTab.innerHTML = '<p>송장 출력을 위한 데이터가 없습니다.</p>';
+        }
+
+        if (data.extracted_data && data.extracted_data.length > 1) {
+            const extHeaders = data.extracted_data[0].map(h => h || '');
+            const extProdIndex = extHeaders.findIndex(h => PROD_CANDIDATES.includes(h));
+            const extQtyIndex = extHeaders.findIndex(h => QTY_CANDIDATES.includes(h));
+            const extItemCodeIndex = extHeaders.findIndex(h => ITEM_CODE_CANDIDATES.includes(h));
+            if (extProdIndex !== -1 && extQtyIndex !== -1) {
+                const productSummary = {};
+                data.extracted_data.slice(1).forEach(row => { const productName = row[extProdIndex]?.trim() || '이름 없음'; const quantity = formatQty(row[extQtyIndex]); const itemCode = (extItemCodeIndex !== -1) ? (row[extItemCodeIndex] || '') : ''; if (!productSummary[productName]) productSummary[productName] = { qty: 0, code: itemCode }; productSummary[productName].qty += quantity; });
+                const summaryArray = Object.entries(productSummary).map(([prod, data]) => ({ prod, qty: data.qty, code: data.code }));
+                sortItemsHangulThenEngAsc(summaryArray);
+                const totalSummaryQty = summaryArray.reduce((sum, item) => sum + item.qty, 0);
+                const finalTotalQty = totalSummaryQty + parcelCount;
+                const qtyHeaderWithTotal = `수량 (상품: ${totalSummaryQty} / 총: ${finalTotalQty})`;
+                const summaryHeader = ['품목코드', '상품명(제품)', qtyHeaderWithTotal];
+                const dataRows = summaryArray.map(item => [item.code, item.prod, item.qty]);
+                const shippingRow = ['9807411000010', '택배수량', parcelCount];
+                const summaryDataForTable = [summaryHeader, shippingRow, ...dataRows];
+                summaryTab.innerHTML = createTable(summaryDataForTable, "제품 취합 / 장부 입력", "summary-table");
+                const summaryTitle = summaryTab.querySelector('h2');
+                if (summaryTitle && !summaryTitle.querySelector('button')) {
+                    summaryTitle.insertAdjacentHTML('beforeend', ` <button id="download-summary-btn" style="font-size: 12px; vertical-align: middle;">XLS 다운로드</button>`);
+                    document.getElementById('download-summary-btn').addEventListener('click', () => { const table = summaryTab.querySelector('table'); if (table) { const dataForExport = []; const rows = table.querySelectorAll('tbody tr'); rows.forEach(row => { const itemCode = row.cells[0]?.textContent.trim() || ''; const quantity = row.cells[2]?.textContent.trim() || ''; dataForExport.push([itemCode, null, null, null, quantity]); }); const ws = XLSX.utils.aoa_to_sheet(dataForExport); const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, "제품취합");
+                        const today = new Date();
+                        const dateString = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, '0')}${String(today.getDate()).padStart(2, '0')}`;
+                        const fileName = `라익미 택배 매출_${dateString}.xls`;
+                        downloadExcelBlob(wb, fileName);
+                    } });
+                }
+            } else {
+                summaryTab.innerHTML = '<p>요약 데이터를 생성할 수 없습니다.</p>';
+            }
+        } else {
+            summaryTab.innerHTML = '<p>요약할 데이터가 없습니다.</p>';
+        }
+
+        if (data.extraction_error) errorContainer.textContent = data.extraction_error;
+
+        // --- 품목코드 열 복사 및 토스트 알림 (교체할 블록) ---
+        if (!document._copyListenerAttached) {
+            // 토스트 엘리먼트 추가 (한 번만)
+            const makeToastContainer = () => {
+                if (document.getElementById('cg-toast-container')) return;
+                const div = document.createElement('div');
+                div.id = 'cg-toast-container';
+                div.style.position = 'fixed';
+                div.style.right = '20px';
+                div.style.bottom = '20px';
+                div.style.zIndex = 9999;
+                document.body.appendChild(div);
+            };
+            const showToast = (msg, timeout = 2500) => {
+                makeToastContainer();
+                const container = document.getElementById('cg-toast-container');
+                const t = document.createElement('div');
+                t.textContent = msg;
+                t.style.background = 'rgba(0,0,0,0.8)';
+                t.style.color = '#fff';
+                t.style.padding = '8px 12px';
+                t.style.marginTop = '8px';
+                t.style.borderRadius = '6px';
+                t.style.fontSize = '13px';
+                t.style.boxShadow = '0 2px 6px rgba(0,0,0,0.2)';
+                t.style.opacity = '0';
+                t.style.transition = 'opacity 180ms ease, transform 180ms ease';
+                t.style.transform = 'translateY(6px)';
+                container.appendChild(t);
+                // show
+                requestAnimationFrame(() => { t.style.opacity = '1'; t.style.transform = 'translateY(0)'; });
+                setTimeout(() => {
+                    t.style.opacity = '0';
+                    t.style.transform = 'translateY(6px)';
+                    setTimeout(() => container.removeChild(t), 200);
+                }, timeout);
+            };
+
+            document.getElementById('tab-content').addEventListener('click', function (event) {
+                const th = event.target.closest('th');
+                if (!th || !th.classList.contains('copyable-header') ) return;
+                // 클릭이 '정리' 탭 내부에서 일어났는지 확인
+                const extractedTab = document.getElementById('extracted-data-tab');
+                if (!extractedTab || !extractedTab.contains(th)) return;
+
+                const table = th.closest('table');
+                if (!table) return;
+                const columnIndex = Array.from(th.parentElement.children).indexOf(th);
+                if (columnIndex === -1) return;
+                const rows = table.querySelectorAll('tbody tr');
+                const columnData = Array.from(rows).map(row => { const cell = row.cells[columnIndex]; return cell ? cell.textContent.trim() : ''; }).filter(text => text);
+
+                if (columnData.length === 0) {
+                    showToast('복사할 항목이 없습니다.');
+                    return;
+                }
+
+                const textToCopy = columnData.join('\n');
+
+                // navigator.clipboard 우선 사용, 실패하면 폴백
+                const copyWithFallback = (text) => {
+                    return new Promise((resolve, reject) => {
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(text).then(resolve).catch(() => {
+                                // 폴백
+                                try {
+                                    const ta = document.createElement('textarea');
+                                    ta.value = text;
+                                    ta.style.position = 'fixed';
+                                    ta.style.left = '-9999px';
+                                    document.body.appendChild(ta);
+                                    ta.select();
+                                    document.execCommand('copy');
+                                    document.body.removeChild(ta);
+                                    resolve();
+                                } catch (err) {
+                                    reject(err);
+                                }
+                            });
+                        } else {
+                            // 폴백
+                            try {
+                                const ta = document.createElement('textarea');
+                                ta.value = text;
+                                ta.style.position = 'fixed';
+                                ta.style.left = '-9999px';
+                                document.body.appendChild(ta);
+                                ta.select();
+                                document.execCommand('copy');
+                                document.body.removeChild(ta);
+                                resolve();
+                            } catch (err) {
+                                reject(err);
+                            }
+                        }
+                    });
+                };
+
+                copyWithFallback(textToCopy).then(() => {
+                    showToast(`'품목코드' 열의 ${columnData.length}개 항목이 복사되었습니다.`);
+                }).catch(err => {
+                    console.error('복사 실패:', err);
+                    showToast('클립보드 복사에 실패했습니다. (브라우저 권한 확인 필요)');
+                    alert(`복사 실패: ${err && err.message ? err.message : err}`);
+                });
+            });
+            document._copyListenerAttached = true;
+        }
+
+        document.querySelector('.tab-link[data-tab="full-data-tab"]').click();
+        window.highlightInventoryShortage();
+    };
+
+    // --- 앱 초기화 ---
+    const initializeApp = async () => {
+        initializeTabs();
+        initializeAdminTabs();
+
+        try {
+            const response = await fetch('/last_result');
+            const data = await response.json();
+            if (data && data.full_data) {
+                renderResultTabs(data);
+            }
+        } catch (error) {
+            console.error("이전 작업 결과 로딩 중 오류 발생:", error);
+        }
+    };
+
+    // --- 파일 업로드 이벤트 ---
+    document.getElementById('upload-form').addEventListener('submit', async function (event) {
+        event.preventDefault();
+        const fileInput = document.getElementById('file-input');
+        const file = fileInput.files[0];
+        const resultContainer = document.getElementById('result-container');
+        const errorContainer = document.getElementById('error-message-container');
+
+        resultContainer.style.display = 'none';
+        if (!file) { errorContainer.innerHTML = '파일을 선택해주세요.'; resultContainer.style.display = 'block'; return; }
+
+        const formData = new FormData();
+        formData.append('file', file);
+
+        try {
+            const response = await fetch('/upload', { method: 'POST', body: formData });
+            const data = await response.json();
+            if (data.error) throw new Error(data.error);
+            renderResultTabs(data);
+
+            // --- START: 새 파일 업로드 시 재고 탭 내용 초기화 ---
+            const inventoryTbody = document.querySelector('#inventory-grid tbody');
+            if (inventoryTbody) {
+                inventoryTbody.innerHTML = ''; // tbody 내용 모두 삭제
+                const inventoryHeaders = ['상품코드', '제품위치', '-', '상품명', '-', '-', '본사창고', '불량창고', '업체창고', 'A/S창고', '-', '-', '-', '-', '-', '-', '-', '-', '재고수량', '단가', '-', '본사창고', '불량창고', '스마트 인천이동', '업체창고', '인천창고', '입고대기창고', 'A/S창고'];
+                const newRowHtml = '<tr>' + '<td contenteditable="true"></td>'.repeat(inventoryHeaders.length) + '</tr>';
+                for (let i = 0; i < 200; i++) { // 200개의 새로운 빈 행 생성
+                    inventoryTbody.insertAdjacentHTML('beforeend', newRowHtml);
+                }
+                const statusEl = document.querySelector('#inventory-status');
+                if(statusEl) {
+                    statusEl.textContent = '새 파일이 업로드되었습니다. 재고를 다시 입력해주세요.';
+                    statusEl.style.color = 'blue';
+                }
+            }
+            // --- END: 새 파일 업로드 시 재고 탭 내용 초기화 ---
+        } catch (error) {
+            console.error('업로드 실패:', error);
+            resultContainer.style.display = 'block';
+            errorContainer.textContent = '파일 업로드에 실패했습니다: ' + error.message;
+        }
+    });
+
+    initializeApp();
+});
+</script>
+</body>
+</html>
